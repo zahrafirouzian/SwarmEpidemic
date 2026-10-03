@@ -1,0 +1,8 @@
+# Exclude large datasets
+data/*.jsonl.gz
+data/*.csv
+!data/.gitkeep
+
+# Exclude virtual environment
+.venv/
+__pycache__/
