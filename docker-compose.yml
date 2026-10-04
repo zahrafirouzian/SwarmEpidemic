@@ -1,0 +1,9 @@
+services:
+  swarm-epidemic:
+    build: .
+    container_name: swarm_epidemic_console
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data:ro
