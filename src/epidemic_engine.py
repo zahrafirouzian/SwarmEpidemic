@@ -1,105 +1,81 @@
+"""
+Epidemic Engine for Swarm Information Forensics.
+Calculates Patient Zero, R0, Transmission Graphs, and Super-Spreader rankings.
+"""
+
 import pandas as pd
 import networkx as nx
-from typing import Dict, Any, List
+from typing import Dict, Any
 
-class SwarmEpidemicEngine:
-    def __init__(self, data_path: str = "data/cleaned_messages.csv"):
-        self.data_path = data_path
-        self.df = None
 
-    def load_data(self):
-        if self.df is None:
-            self.df = pd.read_csv(self.data_path)
-            self.df["timestamp"] = pd.to_datetime(self.df["timestamp"])
-            self.df = self.df.sort_values(by="timestamp").reset_index(drop=True)
+def find_patient_zero(incident_df: pd.DataFrame) -> pd.Series:
+    """Find the earliest recorded occurrence (Patient Zero) of an incident."""
+    if incident_df.empty:
+        return pd.Series()
+    sorted_df = incident_df.sort_values(by="timestamp", ascending=True)
+    return sorted_df.iloc[0]
 
-    def analyze_cascade(self, keyword: str, time_window_minutes: int = 60) -> Dict[str, Any]:
-        self.load_data()
-        
-        # Filter matching messages
-        matches = self.df[self.df["content"].fillna("").str.contains(keyword, case=False, regex=False)].copy()
-        
-        if matches.empty:
-            return {"status": "error", "message": f"No messages found for '{keyword}'"}
 
-        matches = matches.sort_values(by="timestamp").reset_index(drop=True)
-        
-        # 1. Identify Patient Zero
-        p_zero = matches.iloc[0]
-        patient_zero_info = {
-            "speaker": p_zero["speaker"],
-            "timestamp": str(p_zero["timestamp"]),
-            "room_id": p_zero["room_id"],
-            "content": p_zero["content"][:200]
-        }
+def build_transmission_network(
+    incident_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    time_window_minutes: int = 60
+) -> nx.DiGraph:
+    """
+    Construct a directed epidemic transmission graph.
+    Edge A -> B implies Agent A spoke in a room, and Agent B spoke subsequently
+    within the time window, propagating the incident keyword.
+    """
+    graph = nx.DiGraph()
+    if incident_df.empty:
+        return graph
 
-        # 2. Build Transmission Graph (NetworkX DiGraph)
-        G = nx.DiGraph()
-        
-        # Add all unique participants
-        for spk in matches["speaker"].unique():
-            G.add_node(spk, label=spk[:8] + "...", full_id=spk)
+    incident_msgs = incident_df.sort_values(by="timestamp").to_dict("records")
+    time_delta = pd.Timedelta(minutes=time_window_minutes)
 
-        # Track sequential exposure per room
-        time_delta = pd.Timedelta(minutes=time_window_minutes)
-        edges_added = []
-        
-        for i in range(len(matches)):
-            curr_row = matches.iloc[i]
-            curr_speaker = curr_row["speaker"]
-            curr_room = curr_row["room_id"]
-            curr_time = curr_row["timestamp"]
-            
-            # Find subsequent messages in the same room within the time window
-            subsequent = matches.iloc[i+1:]
-            subsequent = subsequent[
-                (subsequent["room_id"] == curr_room) &
-                (subsequent["speaker"] != curr_speaker) &
-                (subsequent["timestamp"] <= curr_time + time_delta)
-            ]
-            
-            for _, target_row in subsequent.iterrows():
-                target_speaker = target_row["speaker"]
-                if not G.has_edge(curr_speaker, target_speaker):
-                    G.add_edge(curr_speaker, target_speaker, weight=1, room=curr_room)
-                    edges_added.append((curr_speaker, target_speaker))
+    for i, origin in enumerate(incident_msgs):
+        origin_time = origin["timestamp"]
+        origin_agent = str(origin["speaker"])
+        origin_room = origin["room_id"]
+
+        graph.add_node(origin_agent, room=origin_room)
+
+        for target in incident_msgs[i + 1:]:
+            target_time = target["timestamp"]
+            target_agent = str(target["speaker"])
+            target_room = target["room_id"]
+
+            if target_time - origin_time > time_delta:
+                break
+
+            if origin_room == target_room and origin_agent != target_agent:
+                if graph.has_edge(origin_agent, target_agent):
+                    graph[origin_agent][target_agent]["weight"] += 1
                 else:
-                    G[curr_speaker][target_speaker]["weight"] += 1
+                    graph.add_edge(
+                        origin_agent,
+                        target_agent,
+                        weight=1,
+                        time_delta_sec=float((target_time - origin_time).total_seconds())
+                    )
 
-        # 3. Compute Epidemiological Metrics
-        out_degrees = dict(G.out_degree())
-        super_spreaders = sorted(out_degrees.items(), key=lambda x: x[1], reverse=True)[:5]
-        
-        # Basic reproduction number (average transmissions per active spreader)
-        active_spreaders = [deg for deg in out_degrees.values() if deg > 0]
-        r0 = sum(active_spreaders) / len(active_spreaders) if active_spreaders else 0.0
+    return graph
 
-        return {
-            "status": "success",
-            "keyword": keyword,
-            "total_messages": len(matches),
-            "infected_agents": G.number_of_nodes(),
-            "transmissions_count": G.number_of_edges(),
-            "patient_zero": patient_zero_info,
-            "r0": round(r0, 2),
-            "super_spreaders": super_spreaders,
-            "graph": G,
-            "matches_df": matches
-        }
 
-if __name__ == "__main__":
-    engine = SwarmEpidemicEngine()
-    results = engine.analyze_cascade(keyword="simulation")
-    print("=== EPIDEMIC ENGINE TEST ===")
-    print("Status:", results["status"])
-    print("Keyword:", results["keyword"])
-    print("Total Messages:", results["total_messages"])
-    print("Infected Agents:", results["infected_agents"])
-    print("Direct Transmissions (Edges):", results["transmissions_count"])
-    print("Estimated R0:", results["r0"])
-    print("\nPatient Zero:")
-    for k, v in results["patient_zero"].items():
-        print(f"  {k}: {v}")
-    print("\nTop Super-Spreaders (Speaker, Transmissions):")
-    for spk, deg in results["super_spreaders"]:
-        print(f"  {spk}: {deg}")
+def calculate_epidemic_metrics(graph: nx.DiGraph, incident_df: pd.DataFrame) -> Dict[str, Any]:
+    """Calculate R0, transmission counts, and identify super-spreader nodes."""
+    total_nodes = graph.number_of_nodes()
+    total_edges = graph.number_of_edges()
+
+    out_degrees = [d for _, d in graph.out_degree()]
+    r0 = float(sum(out_degrees) / total_nodes) if total_nodes > 0 else 0.0
+
+    spreaders = sorted(graph.out_degree(), key=lambda x: x[1], reverse=True)
+    top_spreaders = [{"agent_id": agent, "transmissions": count} for agent, count in spreaders if count > 0][:5]
+
+    return {
+        "r0": round(r0, 2),
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+        "top_spreaders": top_spreaders
+    }
